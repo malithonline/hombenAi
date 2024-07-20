@@ -1,0 +1,4 @@
+tensorflow
+python-telegram-bot
+Pillow
+numpy
