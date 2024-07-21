@@ -7,7 +7,7 @@ A fun and innovative Telegram bot that allows users to recognize and manage cows
 > HombenAI started as a meme on Facebook, but now it's real... and this is only a prototype! We need to train this model to increase accuracy.
 
 ## ✨ Features
-
+📕 To-do: Improve accuracy with quality dataset
 - 🖼️ Identify cows from photos
 - 🐄 Add new cows to the database
 - 📋 List registered cows
