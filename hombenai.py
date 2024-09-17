@@ -11,6 +11,7 @@ import io
 import json
 import logging
 from config import TOKEN, CONFIDENCE_THRESHOLD
+import cv2
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG)
@@ -67,6 +68,32 @@ def preprocess_image(image):
     img_array = preprocess_input(img_array)
     return img_array
 
+# New image processing functions
+def reduce_noise(image):
+    median = cv2.medianBlur(image, 5)
+    gaussian = cv2.GaussianBlur(median, (5, 5), 0)
+    return gaussian
+
+def segment_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+    edges = cv2.magnitude(sobelx, sobely)
+    edges = cv2.normalize(edges, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    _, threshold = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+
+    return edges, threshold
+
+def enhance_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hist_eq = cv2.equalizeHist(gray)
+
+    min_val, max_val, _, _ = cv2.minMaxLoc(gray)
+    contrast_stretched = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+
+    return hist_eq, contrast_stretched
+
 async def set_commands(application: Application):
     commands = [
         BotCommand("start", "Start the bot"),
@@ -80,7 +107,6 @@ async def set_commands(application: Application):
 async def set_menu(application: Application):
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-# Command handler for /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.full_name
@@ -89,10 +115,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         user_data[user_id]["name"] = user_name
     save_data()
-    
+
     await show_main_menu(update, context)
 
-    # Set commands and menu for the user
     await set_commands(context.application)
     await set_menu(context.application)
 
@@ -115,11 +140,10 @@ async def add_cow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Please send a photo of the cow you want to identify. 🔍")
 
-# Callback query handler
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == 'add_cow':
         context.user_data['awaiting_cow_name'] = True
         await query.message.reply_text("Please enter the name of your cow. 🐄")
@@ -134,30 +158,52 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cow_id = query.data.split('_')[-1]
         await mark_missing(update, context, cow_id)
 
-# Function to handle photos
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     photo_file = await update.message.photo[-1].get_file()
     photo = await photo_file.download_as_bytearray()
-    
+
+    # Convert BytesArray to numpy array
+    nparr = np.frombuffer(photo, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    # Step 1: Noise Reduction
+    denoised = reduce_noise(img)
+    cv2.imwrite('denoised.jpg', denoised)
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open('denoised.jpg', 'rb'), caption="Step 1: Noise Reduction")
+
+    # Step 2: Segmentation
+    edges, threshold = segment_image(denoised)
+    cv2.imwrite('edges.jpg', edges)
+    cv2.imwrite('threshold.jpg', threshold)
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open('edges.jpg', 'rb'), caption="Step 2a: Edge Detection")
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open('threshold.jpg', 'rb'), caption="Step 2b: Thresholding")
+
+    # Step 3: Enhancement
+    hist_eq, contrast_stretched = enhance_image(denoised)
+    cv2.imwrite('hist_eq.jpg', hist_eq)
+    cv2.imwrite('contrast_stretched.jpg', contrast_stretched)
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open('hist_eq.jpg', 'rb'), caption="Step 3a: Histogram Equalization")
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open('contrast_stretched.jpg', 'rb'), caption="Step 3b: Contrast Stretching")
+
     # Preprocess the image for MobileNetV2
     img_array = preprocess_image(photo)
-    
+
     # Use MobileNetV2 to detect if it's a cow
     predictions = cow_detector.predict(img_array)
     decoded_predictions = decode_predictions(predictions, top=3)[0]
-    
+
     is_cow = any(pred[1] == 'ox' or pred[1] == 'cow' for pred in decoded_predictions)
-    
+
     if not is_cow:
         await update.message.reply_text("This doesn't appear to be a cow. Please send a photo of a cow. 🚫🐮")
         return
-    
+
     # If it's a cow, proceed with cow recognition model
     prediction = model.predict(img_array)
     cow_id = str(np.argmax(prediction))
     confidence = np.max(prediction)
-    
+
     if 'adding_cow' in context.user_data:
         # User is adding a new cow
         cow_name = context.user_data['adding_cow']
@@ -176,20 +222,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             await update.message.reply_text(f"This cow is not in our database. Would you like to add it? 🆕")
 
-# Function to list user's cows
 async def list_cows(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     logger.debug(f"Listing cows for user {user_id}")
     logger.debug(f"User data: {user_data}")
     logger.debug(f"Cow data: {cow_data}")
-    
+
     if user_id not in user_data or not user_data[user_id]["cows"]:
         await update.effective_message.reply_text("You don't have any cows registered. 😢")
         return
-    
-    # Use a set to ensure unique cow IDs
+
     unique_cow_ids = set(user_data[user_id]["cows"])
-    
+
     for cow_id in unique_cow_ids:
         logger.debug(f"Processing cow {cow_id}")
         if cow_id not in cow_data:
@@ -201,14 +245,12 @@ async def list_cows(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              InlineKeyboardButton("🚨 Mark as Missing", callback_data=f'mark_missing_{cow_id}')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=cow_info["photo"], 
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=cow_info["photo"],
                                      caption=f"Name: {cow_info['name']}", reply_markup=reply_markup)
 
-    # Update user_data to remove duplicates
     user_data[user_id]["cows"] = list(unique_cow_ids)
     save_data()
 
-# Function to remove a cow
 async def remove_cow(update: Update, context: ContextTypes.DEFAULT_TYPE, cow_id: str) -> None:
     user_id = str(update.effective_user.id)
     if cow_id in user_data[user_id]["cows"]:
@@ -219,21 +261,18 @@ async def remove_cow(update: Update, context: ContextTypes.DEFAULT_TYPE, cow_id:
     else:
         await update.callback_query.message.reply_text("This cow doesn't belong to you or doesn't exist. 🚫")
 
-# Function to mark a cow as missing
 async def mark_missing(update: Update, context: ContextTypes.DEFAULT_TYPE, cow_id: str) -> None:
     user_id = str(update.effective_user.id)
     if cow_id in user_data[user_id]["cows"]:
         missing_cows.append(cow_id)
         save_data()
         cow_info = cow_data[cow_id]
-        # Notify all users
         for user in user_data:
-            await context.bot.send_photo(chat_id=user, photo=cow_info["photo"], 
+            await context.bot.send_photo(chat_id=user, photo=cow_info["photo"],
                                          caption=f"🚨 MISSING COW ALERT 🚨\nName: {cow_info['name']}\nOwner: {user_data[user_id]['name']}\nPlease contact the owner if found.")
     else:
         await update.callback_query.message.reply_text("This cow doesn't belong to you or doesn't exist. 🚫")
 
-# Function to handle text messages
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     if 'awaiting_cow_name' in context.user_data:
@@ -243,7 +282,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         await update.message.reply_text("I'm sorry, I didn't understand that. Please use the menu options or commands. 🤔")
 
-# Set up the application
 def main() -> None:
     load_data()
     application = Application.builder().token(TOKEN).build()
